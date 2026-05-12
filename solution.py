@@ -55,8 +55,8 @@ from splitting import split_data
 
 DATA_FILE     = "./data/dataset.csv"   # path to the dataset CSV
 OUTPUT_FILE   = "results.json"         # where to write the results summary
-BATCH_SIZE    = 4
-USE_GEOMETRIC = False                  # set True to enable geometric feature extraction
+BATCH_SIZE    = 2
+USE_GEOMETRIC = True                   # set True to enable geometric feature extraction
 TEST_FILE        = "./data/test.csv"   # competition test set (labels are null)
 PREDICTIONS_FILE = "predictions.csv"   # output file with predicted labels
 
@@ -111,6 +111,15 @@ if __name__=='__main__':
         tokenizer.pad_token = tokenizer.eos_token
     model.to(device)
 
+    # Precompute the token length of each *prompt* (without the response).
+    # This gives us the index of the first response token in the full sequence.
+    all_prompts = [row["prompt"] for _, row in df.iterrows()]
+    print("Precomputing prompt lengths…")
+    all_prompt_lengths = [
+        len(tokenizer.encode(p, truncation=True, max_length=MAX_LENGTH))
+        for p in tqdm(all_prompts, desc="Tokenising prompts", unit="sample", leave=False)
+    ]
+
     all_features: list = []
     t0 = time.time()
 
@@ -119,6 +128,7 @@ if __name__=='__main__':
 
         # ── 1. Tokenise the current mini-batch ───────────────────────────────
         batch_texts = all_texts[start : start + BATCH_SIZE]
+        batch_prompt_lengths = all_prompt_lengths[start : start + BATCH_SIZE]
         encoding = tokenizer(
             batch_texts,
             return_tensors="pt",
@@ -148,11 +158,13 @@ if __name__=='__main__':
                 hidden[i],   # (n_layers, seq_len, hidden_dim)
                 mask[i],     # (seq_len,)
                 use_geometric=USE_GEOMETRIC,
+                response_start_pos=batch_prompt_lengths[i],
             )
             all_features.append(feat.cpu())
 
     extract_time = time.time() - t0
     print(f"Done in {extract_time:.1f} s  —  {len(all_features)} feature vectors extracted")
+
 
     # Stack into the (N, feature_dim) matrix used by the probe.
     X = np.vstack([f.numpy() for f in all_features])   # shape: (N, feature_dim)
@@ -181,6 +193,12 @@ if __name__=='__main__':
     test_ids   = df_test.index
     print(f"Test set loaded: {len(test_texts)} samples")
 
+    test_prompt_lengths = [
+        len(tokenizer.encode(row["prompt"], truncation=True, max_length=MAX_LENGTH))
+        for _, row in tqdm(df_test.iterrows(), desc="Tokenising test prompts",
+                           total=len(df_test), unit="sample", leave=False)
+    ]
+
     # ── Extract features for test set (same loop as Section 4) ───────────────
     test_features: list = []
 
@@ -188,6 +206,7 @@ if __name__=='__main__':
                     desc="Test extraction & aggregation", unit="batch"):
 
         batch_texts = test_texts[start : start + BATCH_SIZE]
+        batch_test_prompt_lengths = test_prompt_lengths[start : start + BATCH_SIZE]
         encoding = tokenizer(
             batch_texts,
             return_tensors="pt",
@@ -206,7 +225,9 @@ if __name__=='__main__':
 
         for i in range(hidden.size(0)):
             feat = aggregation_and_feature_extraction(
-                hidden[i], mask[i], use_geometric=USE_GEOMETRIC,
+                hidden[i], mask[i],
+                use_geometric=USE_GEOMETRIC,
+                response_start_pos=batch_test_prompt_lengths[i],
             )
             test_features.append(feat.cpu())
 
